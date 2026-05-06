@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mempalace": {
+      "command": "/Users/macbook/Documents/GitHub/DigitalTwin/.venv/bin/mempalace-mcp",
+      "args": [
+        "--palace",
+        "/Users/macbook/.mempalace/palace"
+      ]
+    }
+  }
+}

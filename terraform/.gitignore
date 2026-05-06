@@ -1,0 +1,16 @@
+# Terraform
+.terraform/
+terraform.tfstate
+terraform.tfstate.backup
+*.tfvars
+
+# Generated directories
+webhook_proxy/
+
+# Temporary files
+*.tmp
+*.zip
+
+# OS generated files
+.DS_Store
+Thumbs.db
