@@ -20,6 +20,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 from src.channels.gateway import ChannelGateway, NormalizedMessage, PermissionDeniedError
 from src.channels.slack_adapter import (
     download_slack_file,
+    fetch_thread_root,
     get_audio_file,
     normalize_slack_event,
     send_message,
@@ -191,15 +192,66 @@ Use these memories to answer as yourself:
 
 async def _handle_correction(db, msg: NormalizedMessage, slack_channel: str, thread_ts: str) -> None:
     """
-    Save a message from the corrections channel as a high-confidence memory.
+    Dual-mode handler for the corrections channel.
 
-    The sender of this channel is trusted (set via allowlist in ChannelConfig),
-    so their corrections are auto-approved without admin review.
+    Top-level message → treated as a question: bot answers (same as chat) but nothing
+    is stored. This lets the user see the current answer before composing a correction.
+
+    Thread reply → treated as the actual correction from the subject. The root question
+    is fetched from Slack and embedded into the stored memory content so that vector
+    search finds the correction when the same question is asked again:
+
+        Q: <original question>
+        Correction: <subject's answer>
+
+    Supports both text and voice replies — voice is transcribed via Speech-to-Text.
     """
+    event = msg.raw_payload["event"]
+    root_ts = event.get("thread_ts")
+    is_thread_reply = bool(root_ts) and root_ts != event.get("ts")
+
+    if not is_thread_reply:
+        # Top-level message — answer the question but do not store it
+        await _handle_chat(db, msg, slack_channel, thread_ts)
+        return
+
+    # --- Thread reply: this is the subject's correction ---
+
+    # Fetch the original question to link it to this correction
+    original_question = await fetch_thread_root(slack_channel, root_ts, settings.SLACK_BOT_TOKEN)
+
+    # Resolve content: transcribe voice if present, otherwise use text
+    audio_file = get_audio_file(msg)
+    if audio_file:
+        from src.ingest.transcriber import transcribe_audio
+        from src.storage.gcs import upload_audio
+
+        await send_message(settings.SLACK_BOT_TOKEN, slack_channel, "🎤 Голосове повідомлення отримано. Транскрибую...", thread_ts)
+
+        mime_type = audio_file.get("mimetype", "audio/webm")
+        download_url = audio_file.get("url_private_download") or audio_file.get("url_private", "")
+        audio_bytes = await download_slack_file(download_url, settings.SLACK_BOT_TOKEN)
+        gcs_uri = await upload_audio(audio_bytes, msg.sender_id, mime_type)
+
+        try:
+            content = await transcribe_audio(gcs_uri, mime_type)
+        except Exception as exc:
+            logger.error("Transcription failed for %s: %s", gcs_uri, exc)
+            await send_message(settings.SLACK_BOT_TOKEN, slack_channel, "⚠️ Не вдалося розпізнати мову.", thread_ts)
+            return
+    else:
+        content = msg.content
+
+    if not content.strip():
+        return
+
+    # Embed the question so vector search retrieves this correction for the same question
+    memory_content = f"Q: {original_question}\nCorrection: {content}" if original_question else content
+
     memory_service = MemoryService(db=db, llm=None)
 
     candidate = await memory_service.create_candidate(
-        proposed_content=msg.content,
+        proposed_content=memory_content,
         proposed_type="idea",
         actor=f"subject:{msg.sender_id}",
         proposed_confidence=1.0,
@@ -209,6 +261,7 @@ async def _handle_correction(db, msg: NormalizedMessage, slack_channel: str, thr
             "channel_id": msg.channel_id,
             "sender_id": msg.sender_id,
             "sender_name": msg.sender_name,
+            "original_question": original_question,
         },
     )
 
@@ -217,7 +270,7 @@ async def _handle_correction(db, msg: NormalizedMessage, slack_channel: str, thr
         reviewer_id=msg.sender_id,
     )
 
-    confirmation = "✓ Збережено до бази знань." if _looks_ukrainian(msg.content) else "✓ Saved to knowledge base."
+    confirmation = "✓ Збережено до бази знань." if _looks_ukrainian(content) else "✓ Saved to knowledge base."
     await send_message(
         token=settings.SLACK_BOT_TOKEN,
         channel=slack_channel,

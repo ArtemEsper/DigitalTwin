@@ -111,6 +111,36 @@ async def download_slack_file(url: str, token: str) -> bytes:
         return response.content
 
 
+async def fetch_thread_root(channel_id: str, thread_ts: str, token: str) -> str:
+    """
+    Return the text of the root message of a Slack thread.
+
+    Used to retrieve the original question when processing a thread reply,
+    so corrections can be stored with question context for better retrieval.
+    Returns an empty string if the fetch fails.
+    """
+    import ssl
+    import certifi
+    from slack_sdk import WebClient
+    from slack_sdk.errors import SlackApiError
+
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    client = WebClient(token=token, ssl=ssl_context)
+    try:
+        result = client.conversations_replies(
+            channel=channel_id,
+            ts=thread_ts,
+            limit=1,
+            inclusive=True,
+        )
+        messages = result.get("messages", [])
+        if messages:
+            return messages[0].get("text", "")
+    except SlackApiError as exc:
+        logger.error("Failed to fetch thread root %s: %s", thread_ts, exc.response["error"])
+    return ""
+
+
 async def send_message(
     token: str,
     channel: str,
