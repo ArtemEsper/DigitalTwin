@@ -46,6 +46,9 @@ class NormalizedMessage:
     sender_name: str = ""
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     raw_payload: dict = field(default_factory=dict)
+    # File attachments from the platform (e.g. Slack voice messages).
+    # Each dict contains platform-specific metadata: mimetype, url_private_download, name, etc.
+    files: list[dict] = field(default_factory=list)
 
 
 @dataclass

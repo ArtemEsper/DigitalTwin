@@ -18,6 +18,7 @@ class ChannelType(str, enum.Enum):
 class PermissionLevel(str, enum.Enum):
     read_only_chat = "read_only_chat"
     learn_candidate = "learn_candidate"
+    submit_content = "submit_content"   # trusted sender: text/voice → pending candidates
     admin = "admin"
 
 

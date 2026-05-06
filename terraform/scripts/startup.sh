@@ -123,6 +123,8 @@ export SLACK_BOT_TOKEN=$(fetch_secret "slack-bot-token")
 export SLACK_SIGNING_SECRET=$(fetch_secret "slack-signing-secret")
 export SLACK_CHAT_CHANNEL_ID=$(fetch_secret "slack-chat-channel-id")
 export SLACK_CORRECTIONS_CHANNEL_ID=$(fetch_secret "slack-corrections-channel-id")
+export SLACK_STORIES_CHANNEL_ID=$(fetch_secret "slack-stories-channel-id")
+export SLACK_FATHER_USER_ID=$(fetch_secret "slack-father-user-id")
 
 # Validate that critical secrets are available
 if [ -z "$ANTHROPIC_API_KEY" ] || [ "$ANTHROPIC_API_KEY" = "placeholder-change-in-console" ]; then
@@ -169,6 +171,8 @@ else
     -e SUBJECT_ID="$SUBJECT_ID" \
     -e SLACK_BOT_TOKEN="$SLACK_BOT_TOKEN" \
     -e SLACK_SIGNING_SECRET="$SLACK_SIGNING_SECRET" \
+    -e GCS_AUDIO_BUCKET="$PROJECT_ID-dt-audio" \
+    -e AUDIO_LANGUAGE="uk-UA" \
     -e APP_ENV="production" \
     -e LOG_LEVEL="INFO" \
     -p 8000:8000 \
@@ -193,25 +197,28 @@ from src.database import AsyncSessionLocal
 from src.models.channel_config import ChannelConfig, ChannelType, PermissionLevel
 
 CHANNELS = [
-    ("slack:$SLACK_CHAT_CHANNEL_ID",        PermissionLevel.read_only_chat,  "dt_chat"),
-    ("slack:$SLACK_CORRECTIONS_CHANNEL_ID", PermissionLevel.learn_candidate, "dt_corrections"),
+    ("slack:$SLACK_CHAT_CHANNEL_ID",        PermissionLevel.read_only_chat,  "dt_chat",        []),
+    ("slack:$SLACK_CORRECTIONS_CHANNEL_ID", PermissionLevel.learn_candidate, "dt_corrections", []),
+    ("slack:$SLACK_STORIES_CHANNEL_ID",     PermissionLevel.submit_content,  "dt_stories",     ["$SLACK_FATHER_USER_ID"]),
 ]
 
 async def setup():
     async with AsyncSessionLocal() as db:
-        for channel_id, permission, name in CHANNELS:
-            if not channel_id:
+        for channel_id, permission, name, allowed_users in CHANNELS:
+            if not channel_id or channel_id == "slack:":
                 print(f"WARNING: {name} channel ID not set, skipping")
                 continue
             result = await db.execute(
                 select(ChannelConfig).where(ChannelConfig.channel_id == channel_id)
             )
-            if result.scalar_one_or_none() is None:
+            existing = result.scalar_one_or_none()
+            if existing is None:
                 db.add(ChannelConfig(
                     channel_id=channel_id,
                     channel_type=ChannelType.slack,
                     permission_level=permission,
                     is_active=True,
+                    allowed_user_ids=allowed_users if allowed_users else None,
                 ))
                 print(f"Registered {name} ({channel_id}) as {permission.value}")
             else:

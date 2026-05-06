@@ -17,6 +17,11 @@ from typing import Any, Optional
 
 from src.channels.gateway import NormalizedMessage
 
+_AUDIO_MIMETYPES = frozenset({
+    "audio/webm", "audio/ogg", "audio/mpeg", "audio/mp3",
+    "audio/mp4", "audio/wav", "audio/x-m4a", "audio/aac",
+})
+
 logger = logging.getLogger(__name__)
 
 # Reject events with a timestamp older than this (seconds) to block replay attacks.
@@ -70,6 +75,8 @@ def normalize_slack_event(payload: dict[str, Any]) -> NormalizedMessage:
     if not channel_id or not sender_id:
         raise ValueError("Slack payload missing required fields: channel, user")
 
+    files = event.get("files", [])
+
     return NormalizedMessage(
         channel_id=f"slack:{channel_id}",
         channel_type="slack",
@@ -78,7 +85,30 @@ def normalize_slack_event(payload: dict[str, Any]) -> NormalizedMessage:
         content=content,
         message_id=message_id,
         raw_payload=payload,
+        files=files,
     )
+
+
+def get_audio_file(msg: NormalizedMessage) -> Optional[dict]:
+    """Return the first audio file attachment from a NormalizedMessage, or None."""
+    for f in msg.files:
+        if f.get("mimetype", "") in _AUDIO_MIMETYPES:
+            return f
+    return None
+
+
+async def download_slack_file(url: str, token: str) -> bytes:
+    """Download a private Slack file using bot token authentication."""
+    import httpx
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            follow_redirects=True,
+            timeout=60.0,
+        )
+        response.raise_for_status()
+        return response.content
 
 
 async def send_message(

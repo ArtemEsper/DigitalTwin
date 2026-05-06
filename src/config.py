@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     SLACK_BOT_TOKEN: Optional[str] = None       # xoxb-...
     SLACK_SIGNING_SECRET: Optional[str] = None  # from Slack app Basic Information page
 
+    # --- Voice / Audio ---
+    GCS_AUDIO_BUCKET: str = ""          # GCS bucket for voice message storage, e.g. "my-project-dt-audio"
+    AUDIO_LANGUAGE: str = "uk-UA"       # BCP-47 language code for Speech-to-Text (default: Ukrainian)
+
     # --- App ---
     APP_ENV: str = "development"
     LOG_LEVEL: str = "INFO"

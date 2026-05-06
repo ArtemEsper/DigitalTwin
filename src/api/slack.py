@@ -19,6 +19,8 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 
 from src.channels.gateway import ChannelGateway, NormalizedMessage, PermissionDeniedError
 from src.channels.slack_adapter import (
+    download_slack_file,
+    get_audio_file,
     normalize_slack_event,
     send_message,
     verify_slack_signature,
@@ -70,7 +72,8 @@ async def slack_events(
     if payload.get("type") == "event_callback":
         event = payload.get("event", {})
 
-        # Ignore bot messages and non-message events to prevent feedback loops
+        # Ignore bot messages and non-message events to prevent feedback loops.
+        # Note: file_share subtype is NOT excluded — it carries voice/file submissions.
         if (
             event.get("type") != "message"
             or event.get("bot_id")
@@ -118,6 +121,9 @@ async def _handle_message(payload: dict[str, Any]) -> None:
 
             elif permission == PermissionLevel.learn_candidate:
                 await _handle_correction(db, msg, slack_channel, thread_ts)
+
+            elif permission == PermissionLevel.submit_content:
+                await _handle_submission(db, msg, slack_channel, thread_ts)
 
             await db.commit()
 
@@ -219,6 +225,145 @@ async def _handle_correction(db, msg: NormalizedMessage, slack_channel: str, thr
         thread_ts=thread_ts,
     )
     logger.info("Auto-approved correction from %s → MemoryItem %s", msg.sender_id, item.id)
+
+
+async def _handle_submission(db, msg: NormalizedMessage, slack_channel: str, thread_ts: str) -> None:
+    """
+    Handle content submission from a trusted sender (submit_content channel).
+
+    Text messages → RawSource → CandidateExtractor → pending MemoryCandidates.
+    Voice/audio messages → GCS upload → Speech-to-Text → same pipeline.
+    Candidates are left in 'pending' state for admin review.
+    """
+    audio_file = get_audio_file(msg)
+
+    if audio_file:
+        await _handle_voice_submission(db, msg, audio_file, slack_channel, thread_ts)
+    elif msg.content.strip():
+        await _handle_text_submission(db, msg, slack_channel, thread_ts)
+    else:
+        logger.info("Ignoring empty/unsupported submission from %s", msg.sender_id)
+
+
+async def _handle_text_submission(db, msg: NormalizedMessage, slack_channel: str, thread_ts: str) -> None:
+    """Extract memories from a plain-text message and queue as pending candidates."""
+    from src.ingest.extractor import CandidateExtractor
+    from src.models.raw_source import RawSource, SourceType
+
+    llm = get_llm_provider()
+    memory_service = MemoryService(db=db, llm=None)
+
+    raw_source = RawSource(
+        source_type=SourceType.conversation,
+        title=f"Slack message from {msg.sender_name or msg.sender_id}",
+        content=msg.content,
+        processing_status="pending",
+        source_metadata={"sender_id": msg.sender_id, "channel_id": msg.channel_id},
+    )
+    db.add(raw_source)
+    await db.flush()
+
+    extractor = CandidateExtractor(llm=llm)
+    results = await extractor.extract(msg.content, extraction_mode="biographical")
+
+    for result in results:
+        await memory_service.create_candidate(
+            proposed_content=result.content,
+            proposed_type=result.memory_type,
+            actor=f"slack_submission:{msg.sender_id}",
+            proposed_confidence=result.confidence,
+            proposed_tags=result.tags,
+            raw_source_id=raw_source.id,
+            metadata={"source": "slack_text_submission", "sender_name": msg.sender_name},
+        )
+
+    raw_source.processing_status = "extracted"
+    n = len(results)
+    ua = _looks_ukrainian(msg.content)
+    reply = (
+        f"✓ Повідомлення збережено. Витягнуто {n} спогадів для перевірки."
+        if ua else
+        f"✓ Message saved. Extracted {n} memories for review."
+    )
+    await send_message(settings.SLACK_BOT_TOKEN, slack_channel, reply, thread_ts)
+    logger.info("Text submission from %s → %d candidates (pending)", msg.sender_id, n)
+
+
+async def _handle_voice_submission(
+    db, msg: NormalizedMessage, audio_file: dict, slack_channel: str, thread_ts: str
+) -> None:
+    """
+    Download a Slack voice message, upload to GCS, transcribe via Speech-to-Text,
+    then run through the same extraction pipeline as a text submission.
+    """
+    from src.ingest.extractor import CandidateExtractor
+    from src.ingest.transcriber import transcribe_audio
+    from src.models.raw_source import RawSource, SourceType
+    from src.storage.gcs import upload_audio
+
+    # Acknowledge immediately — transcription can take 30–60 s
+    ack = "🎤 Голосове повідомлення отримано. Транскрибую..." if True else "🎤 Voice message received. Transcribing..."
+    await send_message(settings.SLACK_BOT_TOKEN, slack_channel, ack, thread_ts)
+
+    mime_type = audio_file.get("mimetype", "audio/webm")
+    download_url = audio_file.get("url_private_download") or audio_file.get("url_private", "")
+
+    if not download_url:
+        logger.error("No download URL for audio file from %s", msg.sender_id)
+        await send_message(settings.SLACK_BOT_TOKEN, slack_channel, "⚠️ Не вдалося завантажити аудіофайл.", thread_ts)
+        return
+
+    audio_bytes = await download_slack_file(download_url, settings.SLACK_BOT_TOKEN)
+    gcs_uri = await upload_audio(audio_bytes, msg.sender_id, mime_type)
+
+    try:
+        transcript = await transcribe_audio(gcs_uri, mime_type)
+    except Exception as exc:
+        logger.error("Transcription failed for %s: %s", gcs_uri, exc)
+        await send_message(settings.SLACK_BOT_TOKEN, slack_channel, "⚠️ Не вдалося розпізнати мову. Спробуйте ще раз.", thread_ts)
+        return
+
+    memory_service = MemoryService(db=db, llm=None)
+    raw_source = RawSource(
+        source_type=SourceType.transcript,
+        title=f"Voice message from {msg.sender_name or msg.sender_id}",
+        content=transcript,
+        file_path=gcs_uri,
+        processing_status="pending",
+        source_metadata={
+            "sender_id": msg.sender_id,
+            "channel_id": msg.channel_id,
+            "gcs_uri": gcs_uri,
+            "mime_type": mime_type,
+            "original_filename": audio_file.get("name"),
+        },
+    )
+    db.add(raw_source)
+    await db.flush()
+
+    llm = get_llm_provider()
+    extractor = CandidateExtractor(llm=llm)
+    results = await extractor.extract(transcript, extraction_mode="biographical")
+
+    for result in results:
+        await memory_service.create_candidate(
+            proposed_content=result.content,
+            proposed_type=result.memory_type,
+            actor=f"slack_voice:{msg.sender_id}",
+            proposed_confidence=result.confidence,
+            proposed_tags=result.tags + ["voice_message"],
+            raw_source_id=raw_source.id,
+            metadata={"source": "slack_voice_submission", "gcs_uri": gcs_uri},
+        )
+
+    raw_source.processing_status = "extracted"
+    n = len(results)
+    preview = transcript[:200] + ("…" if len(transcript) > 200 else "")
+    reply = (
+        f"✓ Транскрипцію збережено. Витягнуто {n} спогадів для перевірки.\n\n_{preview}_"
+    )
+    await send_message(settings.SLACK_BOT_TOKEN, slack_channel, reply, thread_ts)
+    logger.info("Voice submission from %s → %d candidates (pending), GCS: %s", msg.sender_id, n, gcs_uri)
 
 
 def _looks_ukrainian(text: str) -> bool:

@@ -28,6 +28,10 @@ pymupdf==1.27.2.3
 slack-sdk==3.33.0
 certifi>=2024.0.0  # SSL certs for macOS Python (used by Slack WebClient)
 
+# Voice message pipeline (GCS storage + Speech-to-Text transcription)
+google-cloud-storage==2.18.2
+google-cloud-speech==2.27.0
+
 # Redis (optional, for future background jobs)
 redis==5.1.1
 

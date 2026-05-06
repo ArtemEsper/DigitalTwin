@@ -27,7 +27,8 @@ resource "google_project_service" "required_apis" {
     "iam.googleapis.com",
     "monitoring.googleapis.com",
     "artifactregistry.googleapis.com",
-    "secretmanager.googleapis.com"
+    "secretmanager.googleapis.com",
+    "speech.googleapis.com"
   ])
 
   service = each.key
@@ -69,6 +70,22 @@ resource "google_storage_bucket" "function_source" {
   force_destroy = true
 
   uniform_bucket_level_access = true
+}
+
+# Storage bucket for voice message audio files
+resource "google_storage_bucket" "audio_storage" {
+  name          = "${var.project_id}-dt-audio"
+  location      = var.region
+  force_destroy = false
+
+  uniform_bucket_level_access = true
+
+  lifecycle_rule {
+    action { type = "Delete" }
+    condition { age = 90 }   # auto-delete raw audio after 90 days
+  }
+
+  depends_on = [google_project_service.required_apis]
 }
 
 # Secret Manager resources
