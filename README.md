@@ -9,7 +9,7 @@ memory. All content flows through a candidate pipeline requiring explicit admin 
 
 ---
 
-## Current Status (2026-05-06)
+## Current Status (2026-05-07)
 
 The following is working end-to-end:
 
@@ -18,7 +18,8 @@ The following is working end-to-end:
 - **Memory Pipeline**: Two extraction modes (`biographical` and `authored_work`) with admin approval
 - **Chat System**: Questions answered in subject's voice, grounded in stored memories
 - **Correction Loop**: Subject corrections auto-approved and immediately improve responses
-- **Slack Integration**: `#dt-chat` channel gets threaded responses; `#dt-corrections` channel auto-approves corrections
+- **Slack Integration**: Three channels — chat, corrections, and story submission (text + voice)
+- **Voice Pipeline**: Slack voice messages → GCS storage → Google Speech-to-Text → knowledge base
 - **GCP Production**: Full end-to-end Slack → Cloud Function → VM → response flow working in production
 
 **GCP Infrastructure (Production — fully working):**
@@ -27,8 +28,9 @@ The following is working end-to-end:
 - **VM Wake-Up**: Stopped VM is resumed with `compute.instances.start` (not recreated); existing Docker containers are started, not re-created
 - **Persistent Storage**: PostgreSQL data survives VM stop/start via persistent disk (`prevent_destroy = true`, `auto_delete = false`)
 - **Secret Management**: All secrets in GCP Secret Manager; fetched via metadata API (no gcloud on COS)
-- **Channel Auto-Registration**: Both Slack channels registered automatically on every VM boot
+- **Channel Auto-Registration**: All three Slack channels registered automatically on every VM boot
 - **Memory Embeddings**: 5815 memories embedded with `voyage-3` (1024 dims), stored in pgvector
+- **GCS Audio Storage**: Voice messages stored at `gs://{bucket}/voice/` with 90-day auto-delete lifecycle
 
 **Not yet implemented:**
 - Discord/WhatsApp adapters (stubs only)
@@ -81,6 +83,7 @@ Running upgrade  -> 0001, enable pgvector extension
 Running upgrade 0001 -> 6e73234c7695, initial schema
 Running upgrade 6e73234c7695 -> 0003, add authored_work memory types
 Running upgrade 0003 -> 0004, add chat sessions table
+Running upgrade 0004 -> 0005, add submit_content permission
 ```
 
 ### 5. Seed the first channel config
@@ -328,10 +331,13 @@ The Digital Twin can participate in Slack channels with different permission lev
 
 ### Channel layout
 
-| Slack channel     | Permission        | Who                     | Behaviour                                                  |
-|-------------------|-------------------|-------------------------|------------------------------------------------------------|
-| `#dt-chat`        | `read_only_chat`  | Everyone                | Messages get a threaded chat response                      |
-| `#dt-corrections` | `learn_candidate` | Father only (allowlist) | Messages saved as `confidence=1.0` memories, auto-approved |
+| Slack channel     | Permission        | Who                     | Behaviour                                                                                                      |
+|-------------------|-------------------|-------------------------|----------------------------------------------------------------------------------------------------------------|
+| `#dt-chat`        | `read_only_chat`  | Everyone                | Messages get a threaded chat response                                                                          |
+| `#dt-corrections` | `learn_candidate` | Father only (allowlist) | **Top-level** message → chat response (not stored); **Thread reply** → stored as `Q: …\nCorrection: …` linked to the question. Supports voice. |
+| `#dt-stories`     | `submit_content`  | Father only (allowlist) | Text or voice messages → GCS → Speech-to-Text → pending candidates for admin review                           |
+
+**Why thread-based corrections?** Asking a question (top-level) shows the current answer without storing it. The father replies in that thread to correct the answer — the correction is stored with the original question embedded, so vector search retrieves it precisely when the same question is asked again.
 
 ### One-time setup
 
@@ -343,6 +349,7 @@ Go to https://api.slack.com/apps → Create New App → From scratch.
 - `chat:write`
 - `channels:history`
 - `groups:history`
+- `files:read`
 
 Install to workspace, copy the **Bot Token** (`xoxb-...`).
 **Basic Information** → copy the **Signing Secret**.
@@ -371,7 +378,7 @@ Subscribe to bot events: `message.channels`, `message.groups`.
 
 **5. Create channels and invite the bot**
 
-Create `#dt-chat` and `#dt-corrections` in Slack. In each: `/invite @YourBotName`.
+Create `#dt-chat`, `#dt-corrections`, and `#dt-stories` in Slack. In each: `/invite @YourBotName`.
 
 **6. Seed channel configs**
 
@@ -398,12 +405,21 @@ async def seed():
             is_active=True,
             allowed_user_ids=["U_FATHER_SLACK_USER_ID"],
         ))
+        session.add(ChannelConfig(
+            channel_id="slack:C_STORIES_CHANNEL_ID",
+            channel_type=ChannelType.slack,
+            permission_level=PermissionLevel.submit_content,
+            is_active=True,
+            allowed_user_ids=["U_FATHER_SLACK_USER_ID"],
+        ))
         await session.commit()
         print("Done.")
 
 asyncio.run(seed())
 EOF
 ```
+
+In GCP production, channels are registered automatically on VM boot via the startup script — no manual seeding needed.
 
 ---
 
@@ -449,16 +465,20 @@ cp terraform.tfvars.example terraform.tfvars
 Before deploying, create the application secrets in Google Secret Manager:
 
 ```bash
-# Open GCP Console → Secret Manager
-# Create the following secrets:
-
-# Required secrets:
 gcloud secrets create anthropic-api-key --data-file=- <<< "your-anthropic-api-key"
 gcloud secrets create admin-api-key --data-file=- <<< "your-secure-admin-key"
 gcloud secrets create voyage-api-key --data-file=- <<< "your-voyage-api-key"
 gcloud secrets create subject-id --data-file=- <<< "default"
+gcloud secrets create slack-bot-token --data-file=- <<< "xoxb-..."
+gcloud secrets create slack-signing-secret --data-file=- <<< "..."
 
-# Or create via GCP Console UI for better security
+# Channel IDs (from Slack channel details)
+gcloud secrets create slack-chat-channel-id --data-file=- <<< "C_CHAT_CHANNEL_ID"
+gcloud secrets create slack-corrections-channel-id --data-file=- <<< "C_CORRECTIONS_CHANNEL_ID"
+gcloud secrets create slack-stories-channel-id --data-file=- <<< "C_STORIES_CHANNEL_ID"
+
+# Father's Slack user ID (his profile → ⋮ → Copy member ID)
+gcloud secrets create slack-father-user-id --data-file=- <<< "U_FATHER_USER_ID"
 ```
 
 **3. Build and push container**
@@ -553,11 +573,12 @@ See `docs/cloud_deployment_pitfalls.md` for the complete list of all 24 pitfalls
 
 ## Channel Permission Levels
 
-| Level              | Can chat | Can create candidates | Can approve |
-|--------------------|----------|-----------------------|-------------|
-| `read_only_chat`   | Yes      | No                    | No          |
-| `learn_candidate`  | Yes      | Yes (pending review)  | No          |
-| `admin`            | Yes      | Yes                   | Yes         |
+| Level              | Can chat | Can create candidates       | Auto-approved | Can approve |
+|--------------------|----------|-----------------------------|---------------|-------------|
+| `read_only_chat`   | Yes      | No                          | —             | No          |
+| `learn_candidate`  | Yes      | Yes (high-confidence)       | Yes           | No          |
+| `submit_content`   | No       | Yes (pending admin review)  | No            | No          |
+| `admin`            | Yes      | Yes                         | Yes           | Yes         |
 
 Unknown or inactive channels receive `403 Forbidden`.
 
@@ -654,17 +675,18 @@ docker compose up -d postgres
 
 ```
 src/
-  api/          ← FastAPI routes (health, memory ingest, admin)
+  api/          ← FastAPI routes (health, memory ingest, admin, slack events)
   channels/     ← Channel adapters (Slack, Discord, WhatsApp stubs) + gateway
-  ingest/       ← Document parser (.pdf/.docx/.txt) + LLM candidate extractor
+  ingest/       ← Document parser (.pdf/.docx/.txt) + LLM extractor + transcriber
   llm/          ← LLM provider abstraction (Anthropic, OpenAI, Local)
   memory/       ← Memory service (candidate pipeline + retrieval)
   models/       ← SQLAlchemy ORM models (all dt_ prefixed)
+  storage/      ← GCS audio upload (voice messages)
   config.py     ← Settings via pydantic-settings
   database.py   ← Async SQLAlchemy engine and session
   main.py       ← FastAPI app factory
 alembic/
-  versions/     ← Migration files
+  versions/     ← Migration files (0001–0005)
 docs/
   adr/          ← Architecture Decision Records
 plans/
